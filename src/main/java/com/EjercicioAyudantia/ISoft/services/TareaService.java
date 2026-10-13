@@ -17,8 +17,9 @@ public class TareaService {
         private final AtomicLong idCounter = new AtomicLong(1);
 
         // POST /tasks
-        public Tarea createTask( Tarea task) {
-            task.setId(idCounter.getAndIncrement()); // Asigna ID autoincremental
+        public Tarea createTask(Tarea task) {
+            task.setId(idCounter.getAndIncrement());
+            task.setCompletada(false);
             tasks.add(task);
             return task;
         }

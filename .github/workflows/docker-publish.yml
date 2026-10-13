@@ -1,29 +1,173 @@
-name: Construir y publicar en GHCR
+name: CI/CD - API de tareas
 
 on:
+  pull_request:
+    branches:
+      - develop
+      - main
   push:
     branches:
+      - develop
       - main
   workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
+
+# Evita publicaciones simultaneas desde la misma rama.
+concurrency:
+  group: tareas-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  publicar:
+  validar-y-publicar:
+    name: Validar API y publicar imagen
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Descargar codigo
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Preparar nombre de imagen
         shell: bash
         run: |
           echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
+      - name: Compilar, ejecutar pruebas y construir imagen
+        run: |
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$IMAGE:$GITHUB_SHA" \
+            .
+
+      - name: Iniciar contenedor
+        run: |
+          docker run -d \
+            --name tareas-ci \
+            -p 127.0.0.1:8080:8080 \
+            -e SERVER_PORT=8080 \
+            "$IMAGE:$GITHUB_SHA"
+
+      - name: Esperar a que la API este disponible
+        shell: bash
+        run: |
+          for intento in {1..30}; do
+            if curl --fail --silent http://localhost:8080/tasks > /dev/null; then
+              echo "La API esta disponible."
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "La API no inicio dentro del tiempo esperado."
+          docker logs tareas-ci
+          exit 1
+
+      - name: Probar POST, filtros y PATCH
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="http://localhost:8080"
+
+          # Crear una tarea ALTA y comprobar el codigo 201.
+          STATUS=$(curl -sS -o /tmp/tarea-alta.json -w "%{http_code}" \
+            -X POST "$BASE/tasks" \
+            -H "Content-Type: application/json" \
+            -d '{"titulo":"Revisar documentacion","prioridad":"ALTA","fechaLimite":"2025-06-30"}')
+
+          test "$STATUS" = "201"
+          jq -e '
+            (.id | type == "number") and
+            .titulo == "Revisar documentacion" and
+            .prioridad == "ALTA" and
+            .fechaLimite == "2025-06-30" and
+            .completada == false
+          ' /tmp/tarea-alta.json
+
+          ID=$(jq -r '.id' /tmp/tarea-alta.json)
+
+          # Crear tareas MEDIA y BAJA sin fecha.
+          for PRIORIDAD in MEDIA BAJA; do
+            STATUS=$(curl -sS -o /tmp/otra-tarea.json -w "%{http_code}" \
+              -X POST "$BASE/tasks" \
+              -H "Content-Type: application/json" \
+              -d "{\"titulo\":\"Preparar demo\",\"prioridad\":\"$PRIORIDAD\"}")
+
+            test "$STATUS" = "201"
+            jq -e --argjson anterior "$ID" '
+              .id > $anterior and
+              .fechaLimite == null and
+              .completada == false
+            ' /tmp/otra-tarea.json
+          done
+
+          # GET sin filtros: deben existir tres tareas.
+          STATUS=$(curl -sS -o /tmp/lista.json -w "%{http_code}" "$BASE/tasks")
+          test "$STATUS" = "200"
+          jq -e 'length == 3' /tmp/lista.json
+
+          # Comprobar cada prioridad.
+          for PRIORIDAD in ALTA MEDIA BAJA; do
+            curl -fsS "$BASE/tasks?prioridad=$PRIORIDAD" |
+              jq -e --arg prioridad "$PRIORIDAD" '
+                length == 1 and .[0].prioridad == $prioridad
+              '
+          done
+
+          # Titulo: coincidencia parcial e insensible a mayusculas.
+          curl -fsS "$BASE/tasks?titulo=DOC" |
+            jq -e --argjson id "$ID" 'length == 1 and .[0].id == $id'
+
+          # Fecha exacta.
+          curl -fsS "$BASE/tasks?fechaLimite=2025-06-30" |
+            jq -e --argjson id "$ID" 'length == 1 and .[0].id == $id'
+
+          # Filtros combinados.
+          curl -fsS "$BASE/tasks?prioridad=ALTA&titulo=DOC&fechaLimite=2025-06-30" |
+            jq -e --argjson id "$ID" 'length == 1 and .[0].id == $id'
+
+          # Combinacion sin coincidencias.
+          curl -fsS "$BASE/tasks?prioridad=BAJA&titulo=DOC" |
+            jq -e 'length == 0'
+
+          # Completar la tarea creada.
+          STATUS=$(curl -sS -o /tmp/completada.json -w "%{http_code}" \
+            -X PATCH "$BASE/tasks/$ID/complete")
+
+          test "$STATUS" = "200"
+          jq -e --argjson id "$ID" '
+            .id == $id and .completada == true
+          ' /tmp/completada.json
+
+          # Confirmar que GET ve el cambio: estado compartido.
+          curl -fsS "$BASE/tasks?prioridad=ALTA" |
+            jq -e 'length == 1 and .[0].completada == true'
+
+          # ID inexistente.
+          STATUS=$(curl -sS -o /tmp/no-existe.json -w "%{http_code}" \
+            -X PATCH "$BASE/tasks/999999/complete")
+
+          test "$STATUS" = "404"
+          echo "Todas las pruebas HTTP finalizaron correctamente."
+
+      - name: Mostrar logs si falla
+        if: failure()
+        run: docker logs tareas-ci || true
+
+      - name: Detener contenedor de prueba
+        if: always()
+        run: docker rm -f tareas-ci || true
+
       - name: Autenticarse en GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -31,15 +175,13 @@ jobs:
             --username "$GITHUB_ACTOR" \
             --password-stdin
 
-      - name: Construir imagen y ejecutar pruebas
+      - name: Publicar imagen validada
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          docker build \
-            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-            --tag "$IMAGE:latest" \
-            --tag "$IMAGE:$GITHUB_SHA" \
-            .
-
-      - name: Publicar imagen en GHCR
-        run: |
-          docker push "$IMAGE:latest"
+          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:latest"
           docker push "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:latest"
+
+          echo "### Imagen publicada" >> "$GITHUB_STEP_SUMMARY"
+          echo "- $IMAGE:latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "- $IMAGE:$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
