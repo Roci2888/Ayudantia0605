@@ -1,0 +1,8 @@
+POST http://localhost:8080/tasks
+Content-Type: application/json
+
+{
+  "titulo": "Revisar documentación de la API",
+  "prioridad": "ALTA",
+  "fechaLimite": "2025-06-30"
+}
