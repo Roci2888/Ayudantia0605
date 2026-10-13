@@ -1,12 +1,12 @@
-# Etapa 1: Build de la aplicación
-FROM maven:3.9-eclipse-temurin-17 AS build
+# Etapa 1: compilar y ejecutar las pruebas
+FROM maven:3.9-eclipse-temurin-21 AS build
 WORKDIR /app
 COPY pom.xml .
 COPY src ./src
-RUN mvn clean package -DskipTests
+RUN mvn -B clean verify
 
-# Etapa 2: Ejecución
-FROM eclipse-temurin:17-jre-alpine
+# Etapa 2: ejecutar la aplicación
+FROM eclipse-temurin:21-jre
 WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
 EXPOSE 8080
